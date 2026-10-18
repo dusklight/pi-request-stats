@@ -1,0 +1,269 @@
+{
+  "_comment": [
+    "Estimated request costs for the pi-stats extension.",
+    "Rates are per 1,000,000 tokens, in USD, read from the Standard / Batch / Flex / Fast / Ultrafast",
+    "tables at https://developers.openai.com/api/docs/pricing on 2026-10-18. Update the numbers when",
+    "OpenAI changes them.",
+    "Each mode carries its long-context rates in \"tiers\": they apply to a request once its input tokens",
+    "(input + cache read + cache write) exceed aboveTokens — 272,000 for these models, the same threshold",
+    "pi's own model catalog uses. Cache writes are 125% of the input rate; models the page omits from a",
+    "table have no such mode (GPT-6 Luna has no Ultrafast prices).",
+    "Add your own models or override these in ~/.pi/agent/pi-stats.pricing.json or .pi/pi-stats.pricing.json",
+    "(later files win, model by model). An entry may list extra ids that share its prices:",
+    "\"aliases\": [\"my-local-model\"], or map one id onto another entry with \"my-id\": \"gpt-6.1-sol\".",
+    "Accepted field spellings: input; cachedInput | cacheRead | cachedInputTokens | cache;",
+    "cacheWrite | writeOutputTokens; cacheWrite1h (1-hour prompt-cache writes, charged at 2x base input",
+    "when no rate is given, like pi does); output | reasoningOutputTokens.",
+    "Set \"fallbackModel\": \"\" to stop pricing models that have no entry here.",
+    "Turn cost estimation off entirely with \"cost\": false in any of those files (or PI_STATS_COST=off,",
+    "PI_STATS_NO_COST=1, --pi-stats-no-cost, /cost off). With it off nothing is priced, so the status bar",
+    "drops the money readout and no \"add prices for this model\" hint appears; /cost on switches it back.",
+    "Set the flag to \"on\"/\"off\" or true/false; env and command settings win over the files."
+  ],
+  "currency": "USD",
+  "perTokens": 1000000,
+  "mode": "standard",
+  "preferReportedCost": true,
+  "multiplier": 1,
+  "fallbackModel": "gpt-6.1-sol",
+  "models": {
+    "gpt-6.1-sol": {
+      "name": "GPT-6.1 Sol (OpenAI)",
+      "providers": [
+        "openai",
+        "openai-codex"
+      ],
+      "modes": {
+        "standard": {
+          "input": 2,
+          "cachedInput": 0.1,
+          "cacheWrite": 2.5,
+          "output": 10,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 4,
+              "cachedInput": 0.2,
+              "cacheWrite": 5,
+              "output": 15
+            }
+          ]
+        },
+        "batch": {
+          "input": 1,
+          "cachedInput": 0.05,
+          "cacheWrite": 1.25,
+          "output": 5,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 2,
+              "cachedInput": 0.1,
+              "cacheWrite": 2.5,
+              "output": 7.5
+            }
+          ]
+        },
+        "flex": {
+          "input": 1,
+          "cachedInput": 0.05,
+          "cacheWrite": 1.25,
+          "output": 5,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 2,
+              "cachedInput": 0.1,
+              "cacheWrite": 2.5,
+              "output": 7.5
+            }
+          ]
+        },
+        "fast": {
+          "input": 4,
+          "cachedInput": 0.2,
+          "cacheWrite": 5,
+          "output": 20,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 8,
+              "cachedInput": 0.4,
+              "cacheWrite": 10,
+              "output": 30
+            }
+          ]
+        },
+        "ultrafast": {
+          "input": 12,
+          "cachedInput": 0.6,
+          "cacheWrite": 15,
+          "output": 60,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 24,
+              "cachedInput": 1.2,
+              "cacheWrite": 30,
+              "output": 90
+            }
+          ]
+        }
+      }
+    },
+    "gpt-6-astra": {
+      "name": "GPT-6 Astra (OpenAI)",
+      "providers": [
+        "openai",
+        "openai-codex"
+      ],
+      "modes": {
+        "standard": {
+          "input": 10,
+          "cachedInput": 1,
+          "cacheWrite": 12.5,
+          "output": 50,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 20,
+              "cachedInput": 2,
+              "cacheWrite": 25,
+              "output": 75
+            }
+          ]
+        },
+        "batch": {
+          "input": 5,
+          "cachedInput": 0.5,
+          "cacheWrite": 6.25,
+          "output": 25,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 10,
+              "cachedInput": 1,
+              "cacheWrite": 12.5,
+              "output": 37.5
+            }
+          ]
+        },
+        "flex": {
+          "input": 5,
+          "cachedInput": 0.5,
+          "cacheWrite": 6.25,
+          "output": 25,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 10,
+              "cachedInput": 1,
+              "cacheWrite": 12.5,
+              "output": 37.5
+            }
+          ]
+        },
+        "fast": {
+          "input": 20,
+          "cachedInput": 2,
+          "cacheWrite": 25,
+          "output": 100,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 40,
+              "cachedInput": 4,
+              "cacheWrite": 50,
+              "output": 150
+            }
+          ]
+        },
+        "ultrafast": {
+          "input": 60,
+          "cachedInput": 6,
+          "cacheWrite": 75,
+          "output": 300,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 120,
+              "cachedInput": 12,
+              "cacheWrite": 150,
+              "output": 450
+            }
+          ]
+        }
+      }
+    },
+    "gpt-6-luna": {
+      "name": "GPT-6 Luna (OpenAI)",
+      "providers": [
+        "openai",
+        "openai-codex"
+      ],
+      "_comment": "The Ultrafast table does not list this model, so it has no ultrafast mode.",
+      "modes": {
+        "standard": {
+          "input": 0.1,
+          "cachedInput": 0.01,
+          "cacheWrite": 0.125,
+          "output": 0.5,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 0.2,
+              "cachedInput": 0.02,
+              "cacheWrite": 0.25,
+              "output": 0.75
+            }
+          ]
+        },
+        "batch": {
+          "input": 0.05,
+          "cachedInput": 0.005,
+          "cacheWrite": 0.0625,
+          "output": 0.25,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 0.1,
+              "cachedInput": 0.01,
+              "cacheWrite": 0.125,
+              "output": 0.375
+            }
+          ]
+        },
+        "flex": {
+          "input": 0.05,
+          "cachedInput": 0.005,
+          "cacheWrite": 0.0625,
+          "output": 0.25,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 0.1,
+              "cachedInput": 0.01,
+              "cacheWrite": 0.125,
+              "output": 0.375
+            }
+          ]
+        },
+        "fast": {
+          "input": 0.2,
+          "cachedInput": 0.02,
+          "cacheWrite": 0.25,
+          "output": 1,
+          "tiers": [
+            {
+              "aboveTokens": 272000,
+              "input": 0.4,
+              "cachedInput": 0.04,
+              "cacheWrite": 0.5,
+              "output": 1.5
+            }
+          ]
+        }
+      }
+    }
+  }
+}
