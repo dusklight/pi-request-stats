@@ -1,5 +1,5 @@
 /**
- * Pi Stat Plugin
+ * Pi Request Stats Plugin (pi-request-stats)
  *
  * Shows how long each request took, split into model generation time (thinking,
  * answering, tool-call arguments) and tool execution time, the tokens consumed,
@@ -65,10 +65,15 @@ interface UsageRecord {
 /** Where a cost figure came from, plus the price list that produced it. */
 interface CostOrigin {
   source: CostSource;
+  /** The priced figure itself, so callers do not have to keep it separately. */
+  cost: CostBreakdown;
   pricing?: ModelPricing;
   modeName?: string;
   longContext?: boolean;
+  /** True when the priced model has no entry of its own and the fallback entry's rates were used. */
   fallback?: boolean;
+  /** Display name of the model the figure was priced for — never the price-list entry. */
+  forModel?: string;
 }
 
 interface ModelCostTotals {
@@ -311,10 +316,17 @@ export default function (pi: ExtensionAPI) {
   let costByModel = new Map<string, ModelCostTotals>();
   let runCostSources = new Set<CostSource>();
   let lastRunCostSources = new Set<CostSource>();
+  let sessionCostSources = new Set<CostSource>();
   let modelsWithoutPricing = new Set<string>();
   let missingPricingHintShown = false;
   let runRecords: UsageRecord[] = [];
   let lastRunRecords: UsageRecord[] = [];
+
+  /**
+   * Last model seen on a usage-bearing entry. Compaction entries carry `usage` but no
+   * model, so this is what their cost gets attributed to (see `compactionModel`).
+   */
+  let lastUsageModel: { provider?: string; model?: string } = {};
 
   // Whether thinking tokens had to be estimated because the engine reports no reasoning count.
   let runReasoningEstimated = false;
@@ -342,9 +354,11 @@ export default function (pi: ExtensionAPI) {
     lastRunOrigin = null;
     runCostSources = new Set();
     lastRunCostSources = new Set();
+    sessionCostSources = new Set();
     sessionCost = emptyCost();
     sessionOtherCost = emptyCost();
     costByModel = new Map();
+    lastUsageModel = {};
     modelsWithoutPricing = new Set();
     missingPricingHintShown = false;
     runRecords = [];
@@ -356,10 +370,25 @@ export default function (pi: ExtensionAPI) {
     return provider ? `${provider}/${model}` : model;
   }
 
+  /**
+   * Model to attribute an entry's usage to. pi writes no `model`/`provider` on compaction
+   * entries (`appendCompaction` in pi's session manager), so a compaction's summary cost is
+   * priced as the model that was running: the one on the entry, else the last model seen in
+   * the session, else the currently selected one.
+   */
+  function compactionModel(entry: object, ctx: ExtensionContext): { provider?: string; model?: string } {
+    const labeled = entry as { model?: string; provider?: string };
+    if (labeled.model) return { provider: labeled.provider, model: labeled.model };
+    if (lastUsageModel.model) return lastUsageModel;
+    const model = ctx.model as { id?: string; provider?: string } | undefined;
+    return { provider: model?.provider, model: model?.id };
+  }
+
   /** Price one usage record and fold it into the per-model totals. */
   function accountUsage(record: UsageRecord, bucket: "request" | "other"): CostOrigin {
     const label = modelLabel(record.provider, record.model);
-    const priced = priceUsage(pricingConfig, record.provider, record.model, record.usage);
+    if (record.model) lastUsageModel = { provider: record.provider, model: record.model };
+    const priced: CostOrigin = { ...priceUsage(pricingConfig, record.provider, record.model, record.usage), forModel: label };
     const target = bucket === "request" ? sessionCost : sessionOtherCost;
     addCost(target, priced.cost);
 
@@ -374,6 +403,7 @@ export default function (pi: ExtensionAPI) {
       record.usage.input + record.usage.output + record.usage.cacheRead + record.usage.cacheWrite;
     addCost(totals.cost, priced.cost);
     totals.sources.add(priced.source);
+    sessionCostSources.add(priced.source);
     if (priced.source !== "unknown" && totals.origin.source === "unknown") totals.origin = priced;
     if (priced.source === "unknown" && record.model) modelsWithoutPricing.add(label);
     return priced;
@@ -389,7 +419,10 @@ export default function (pi: ExtensionAPI) {
     const sources = new Set<CostSource>();
     let origin: CostOrigin | null = null;
     for (const record of records) {
-      const priced = priceUsage(pricingConfig, record.provider, record.model, record.usage);
+      const priced: CostOrigin = {
+        ...priceUsage(pricingConfig, record.provider, record.model, record.usage),
+        forModel: modelLabel(record.provider, record.model),
+      };
       addCost(cost, priced.cost);
       sources.add(priced.source);
       if (priced.source !== "unknown") origin = priced;
@@ -401,14 +434,20 @@ export default function (pi: ExtensionAPI) {
   function recomputeCosts(ctx: ExtensionContext) {
     sessionCost = emptyCost();
     sessionOtherCost = emptyCost();
+    sessionCostSources = new Set();
     costByModel = new Map();
+    lastUsageModel = {};
     modelsWithoutPricing = new Set();
     missingPricingHintShown = false;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type === "usage" && entry.usage) {
         accountUsage({ provider: entry.provider, model: entry.model, usage: entry.usage as EstimateUsage }, "other");
       } else if (entry.type === "compaction" && entry.usage) {
-        accountUsage({ model: entry.model, usage: entry.usage as EstimateUsage }, "other");
+        const model = compactionModel(entry, ctx);
+        accountUsage(
+          { provider: model.provider, model: model.model, usage: entry.usage as EstimateUsage },
+          "other"
+        );
       } else if (entry.type === "message" && entry.message?.role === "assistant") {
         const message = entry.message as { provider?: string; model?: string; usage?: EstimateUsage };
         if (message.usage) {
@@ -424,17 +463,49 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  /** Suffix naming the price list a cost estimate came from. */
-  function originSuffix(origin: CostOrigin | null, sources?: Set<CostSource>): string {
+  /** "≈" in front of a figure that was computed from the price files rather than billed by the provider. */
+  function approxMark(sources: Set<CostSource> | undefined): string {
+    return sources && sources.has("estimated") ? "≈" : "";
+  }
+
+  /**
+   * Suffix saying whether a figure is provider-billed or estimated, and which entry of the
+   * price file supplied the rates. The name quoted is always a price-list entry, never a claim
+   * about which model ran — hence "estimate from the price file" wording, plus an extra clause in
+   * the full form when the model had no entry of its own and borrowed another entry's rates.
+   *
+   * `brief` is the one-line form used by the request-complete summary, where the model of that
+   * request is already known from context, so it can drop the model id, the spelled-out
+   * explanation and the note that the model had no entry of its own: `priced as "<entry>"` marks
+   * the quoted name as a price entry by itself. Reports (`/stats`, `/cost`) keep the full wording,
+   * which names the model and spells out that the quoted name is a price entry rather than the
+   * model that ran.
+   */
+  function originSuffix(origin: CostOrigin | null, sources?: Set<CostSource>, brief = false): string {
     const known = sources ? [...sources].filter((source) => source !== "unknown" && source !== "off") : [];
     if (known.length > 1) {
-      return ` (${known.join(" + ")} costs combined)`;
+      return brief
+        ? " (estimated + provider-billed parts — /cost breaks them down per model)"
+        : " (sum of provider-billed and estimated parts — /cost breaks them down per model)";
     }
     if (!origin) return "";
-    if (origin.source === "reported") return " (reported by provider)";
+    if (origin.source === "reported") {
+      return brief ? " (billed by the provider)" : " (billed by the provider — not an estimate)";
+    }
     if (origin.source === "estimated" && origin.pricing) {
-      const note = origin.fallback ? `${origin.pricing.key} @ ${origin.modeName}, fallback prices` : origin.pricing.key + " @ " + origin.modeName;
-      return ` (${note}${origin.longContext ? ", long context" : ""})`;
+      if (brief) {
+        const rates = `${origin.modeName} rates${origin.longContext ? " +long-context tier" : ""}`;
+        return ` (estimated, priced as "${origin.pricing.key}" ${rates})`;
+      }
+      const rates = `${origin.modeName} rates${origin.longContext ? " (long-context tier)" : ""}`;
+      if (origin.fallback) {
+        const named = origin.forModel && origin.forModel !== "unknown model" ? `"${origin.forModel}"` : "That model";
+        return (
+          ` (estimate from the price file: ${named} has no entry of its own, so the ` +
+          `"${origin.pricing.key}" entry's ${rates} were used — that quoted name is the pricing entry, not the model)`
+        );
+      }
+      return ` (estimate from the price file: "${origin.pricing.key}" entry, ${rates})`;
     }
     return "";
   }
@@ -448,13 +519,13 @@ export default function (pi: ExtensionAPI) {
 
   // Reconstruct compaction count, token totals, timing and cost from session history on startup
   pi.on("session_start", async (_event, ctx) => {
-    pricingExplicitPath = (pi.getFlag("pi-stats-pricing") as string | undefined) || undefined;
+    pricingExplicitPath = (pi.getFlag("pi-request-stats-pricing") as string | undefined) || undefined;
     pricingConfig = loadPricing(ctx.cwd, pricingExplicitPath);
-    // --pi-stats-no-cost wins over the price files, and stays off for the whole session
+    // --pi-request-stats-no-cost wins over the price files, and stays off for the whole session
     // unless /cost on re-enables it (a later /cost reload would apply the files again).
-    if (pi.getFlag("pi-stats-no-cost") === true) {
+    if (pi.getFlag("pi-request-stats-no-cost") === true) {
       pricingConfig.costEnabled = false;
-      pricingConfig.costEnabledSource = "--pi-stats-no-cost";
+      pricingConfig.costEnabledSource = "--pi-request-stats-no-cost";
     }
     resetCostState();
     compactionCount = 0;
@@ -508,7 +579,11 @@ export default function (pi: ExtensionAPI) {
       if (entry.type === "compaction") {
         compactionCount++;
         if (entry.usage) {
-          accountUsage({ model: entry.model, usage: entry.usage as EstimateUsage }, "other");
+          const model = compactionModel(entry, ctx);
+          accountUsage(
+            { provider: model.provider, model: model.model, usage: entry.usage as EstimateUsage },
+            "other"
+          );
         }
         flushToolBatch();
         lastAssistantEnd = null;
@@ -579,7 +654,7 @@ export default function (pi: ExtensionAPI) {
     // A typo in a price file would otherwise only show up as silently missing costs.
     if (pricingConfig.errors.length > 0) {
       ctx.ui.notify(
-        [`pi-stats pricing: ${pricingConfig.errors.length} problem${pricingConfig.errors.length !== 1 ? "s" : ""} in the price files.`].concat(
+        [`pi-request-stats pricing: ${pricingConfig.errors.length} problem${pricingConfig.errors.length !== 1 ? "s" : ""} in the price files.`].concat(
           pricingConfig.errors.slice(0, 4).map((error) => `⚠️ ${error}`),
           [pricingConfig.errors.length > 4 ? "⚠️ … more with /cost" : "", "Fix the file and run /cost reload."].filter(Boolean)
         ).join("\n"),
@@ -608,6 +683,7 @@ export default function (pi: ExtensionAPI) {
     runToolMs = 0;
     runReasoningEstimated = false;
     runCost = emptyCost();
+    runCostSources = new Set();
     runRecords = [];
     lastStatusUpdate = 0;
     resetStreamingState();
@@ -784,6 +860,7 @@ export default function (pi: ExtensionAPI) {
       runChars = createPhaseChars();
       runToolMs = 0;
       runCost = emptyCost();
+      runCostSources = new Set();
       runRecords = [];
 
       const genMs = genMsOf(lastRunGen);
@@ -822,9 +899,10 @@ export default function (pi: ExtensionAPI) {
 
   // Cost of the summary generated by a compaction
   pi.on("session_compact", async (event, ctx) => {
-    const entry = event.compactionEntry as { model?: string; usage?: EstimateUsage };
+    const entry = event.compactionEntry as { model?: string; provider?: string; usage?: EstimateUsage };
     if (!entry.usage) return;
-    const record: UsageRecord = { model: entry.model, usage: entry.usage };
+    const model = compactionModel(entry, ctx);
+    const record: UsageRecord = { provider: model.provider, model: model.model, usage: entry.usage };
     const priced = accountUsage(record, "other");
     if (agentStartTime !== null) {
       addCost(runCost, priced.cost);
@@ -886,7 +964,7 @@ export default function (pi: ExtensionAPI) {
       );
       lines.push("");
       if (lastRunCost && pricingConfig.costEnabled) {
-        lines.push(`Last request cost: ${lastRunCostLine()}`);
+        lines.push(`Last request cost: ${lastRunCostLine(lastRunCost)}`);
       }
       lines.push(...sessionCostLines());
 
@@ -908,15 +986,17 @@ export default function (pi: ExtensionAPI) {
 
       // Master switch for cost estimation: on, off, toggle, or a look at the current state.
       if (sub === "on" || sub === "enable" || sub === "off" || sub === "disable" || sub === "toggle" || sub === "status") {
-        const want = sub === "on" || sub === "enable" ? true : sub === "off" || sub === "disable" ? false : undefined;
-        pricingConfig.costEnabled = want === undefined ? !pricingConfig.costEnabled : want;
-        if (pricingConfig.costEnabled) pricingConfig.costEnabledSource = "/cost on";
-        else pricingConfig.costEnabledSource = "/cost off";
-        // Re-price the whole session so the totals match the new setting immediately.
-        recomputeCosts(ctx);
+        // /cost status only reports: it must not flip the switch it is describing.
+        if (sub !== "status") {
+          const want = sub === "on" || sub === "enable" ? true : sub === "off" || sub === "disable" ? false : !pricingConfig.costEnabled;
+          pricingConfig.costEnabled = want;
+          pricingConfig.costEnabledSource = pricingConfig.costEnabled ? "/cost on" : "/cost off";
+          // Re-price the whole session so the totals match the new setting immediately.
+          recomputeCosts(ctx);
+        }
         const lines = [
           pricingConfig.costEnabled
-            ? "Cost estimation is on — figures come from the price files below, or from the provider when it reports them."
+            ? "Cost estimation is on — figures marked ≈ are estimated from the price files below; unmarked figures are what the provider billed."
             : "Cost estimation is off — no cost is calculated or shown (turn back on: /cost on)",
         ];
         lines.push(...sessionCostLines());
@@ -936,14 +1016,17 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         const resolved = resolveMode(pricing.pricing, pricingConfig.mode);
-        ctx.ui.notify(
-          [
-            `${pricing.pricing.name} (${pricing.pricing.key}): modes ${pricing.pricing.modeNames.join(", ")}`,
-            `currently using "${resolved?.modeName ?? "none"}"${pricing.fallback ? " (fallback prices for this model)" : ""}`,
-            "switch with: /cost mode <name>",
-          ].join("\n"),
-          "info"
-        );
+        const lines = [
+          `${pricing.pricing.name} (${pricing.pricing.key}): modes ${pricing.pricing.modeNames.join(", ")}`,
+          `estimating the current model with the "${pricing.pricing.key}" entry's ${resolved?.modeName ?? "no"} rates`,
+        ];
+        if (pricing.fallback) {
+          lines.push(
+            `note: "${currentModelLabel(ctx)}" has no entry of its own in the price file, so it is estimated with "${pricing.pricing.key}" rates — "${pricing.pricing.key}" is the pricing entry, and the figure is a comparison, not what that model bills`
+          );
+        }
+        lines.push("switch with: /cost mode <name>");
+        ctx.ui.notify(lines.join("\n"), "info");
         return;
       }
 
@@ -965,7 +1048,7 @@ export default function (pi: ExtensionAPI) {
         recomputeCosts(ctx);
         const lines = [`Estimating with mode "${name}" now.`];
         if (lastRunCost) {
-          lines.push(`Last request cost: ${lastRunCostLine()}`);
+          lines.push(`Last request cost: ${lastRunCostLine(lastRunCost)}`);
         }
         lines.push(...sessionCostLines());
         ctx.ui.notify(lines.join("\n"), "info");
@@ -995,7 +1078,7 @@ export default function (pi: ExtensionAPI) {
           lines.push(...rateLines(pricingConfig, pricing, asked ? undefined : pricingConfig.mode));
         }
         if (pricingConfig.fallbackModel) {
-          lines.push(`(models without their own entry use "${pricingConfig.fallbackLabel}" prices)`);
+          lines.push(`models with no entry of their own are estimated with the "${pricingConfig.fallbackLabel}" entry's rates`);
         }
         ctx.ui.notify(lines.join("\n"), "info");
         return;
@@ -1015,7 +1098,10 @@ export default function (pi: ExtensionAPI) {
       if (match) {
         lines.push("", ...rateLines(pricingConfig, match.pricing));
         if (match.fallback) {
-          lines.push(`note: ${match.pricing.key} prices are a fallback for this model; add its own entry or aliases for exact figures.`);
+          lines.push(
+            `note: the current model has no entry in the price file, so every figure above is an estimate made with the "${match.pricing.key}" entry's rates. ` +
+              `Add an entry for "${currentModelLabel(ctx)}" (or list it under that entry's "aliases") to price it exactly.`
+          );
         }
       } else if (pricingConfig.costEnabled) {
         lines.push("", "The current model has no prices configured, so its cost shows as $0.");
@@ -1026,14 +1112,14 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Show the prices of the current model at a glance
-  pi.registerFlag("pi-stats-pricing", {
-    description: "Path to a pi-stats pricing JSON file (overrides pricing.json and PI_STATS_PRICING)",
+  pi.registerFlag("pi-request-stats-pricing", {
+    description: "Path to a pi-request-stats pricing JSON file (overrides pricing.json and PI_REQUEST_STATS_PRICING)",
     type: "string",
   });
 
   // Start a session without any money readout
-  pi.registerFlag("pi-stats-no-cost", {
-    description: "Disable pi-stats cost estimation for this run (same as /cost off, or PI_STATS_COST=off)",
+  pi.registerFlag("pi-request-stats-no-cost", {
+    description: "Disable pi-request-stats cost estimation for this run (same as /cost off, or PI_REQUEST_STATS_COST=off)",
     type: "boolean",
   });
 
@@ -1042,21 +1128,27 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** "$X — breakdown (source of the rates)" for the request that just finished. */
-  function lastRunCostLine(): string {
-    return `${formatCost(lastRunCost.total)} — ${costDetail(lastRunCost)}${originSuffix(lastRunOrigin, lastRunCostSources)}`;
+  function lastRunCostLine(cost: CostBreakdown, brief = false): string {
+    return `${approxMark(lastRunCostSources)}${formatCost(cost.total)} — ${costDetail(cost)}${originSuffix(lastRunOrigin, lastRunCostSources, brief)}`;
   }
 
-  /** One line pricing the request that just finished. */
+  /**
+   * One line pricing the request that just finished. This is the summary shown at the end of a
+   * response, so it uses the brief price-source wording; `/stats` and `/cost` spell it out.
+   */
   function lastRunCostLines(): string[] {
     if (!lastRunCost || !pricingConfig.costEnabled) return [];
     if (lastRunCost.total > 0) {
-      return [`💵 cost ${lastRunCostLine()}`];
+      return [`💵 cost ${lastRunCostLine(lastRunCost, true)}`];
     }
     if (modelsWithoutPricing.size > 0 && !missingPricingHintShown) {
       // Only nag once per session: an unpriced model repeats this on every request.
       missingPricingHintShown = true;
+      const names = [...modelsWithoutPricing].map((name) => JSON.stringify(name));
+      const subject = names.length === 1 ? `${names[0]} has no entry` : `${names.join(", ")} have no entries`;
+      const pronoun = names.length === 1 ? "it" : "them";
       return [
-        `💵 no cost estimate: add prices for ${[...modelsWithoutPricing].join(", ")} to pi-stats.pricing.json (see /cost rates)`,
+        `💵 no cost estimate: ${subject} in the price files — add ${pronoun} to pi-request-stats.pricing.json, or set "fallbackModel" to price ${pronoun} like another model (see /cost rates)`,
       ];
     }
     return [];
@@ -1075,21 +1167,29 @@ export default function (pi: ExtensionAPI) {
     const lines: string[] = [];
     if (!pricingConfig.costEnabled) {
       // Deliberately no "add prices" hint: nothing is missing, the readout is switched off.
-      lines.push("Session cost: estimation disabled — enable with /cost on (or \"cost\": true in pi-stats.pricing.json)");
+      lines.push("Session cost: estimation disabled — enable with /cost on (or \"cost\": true in pi-request-stats.pricing.json)");
       return lines;
     }
     const total = sessionCost.total + sessionOtherCost.total;
     lines.push(
-      `Session cost: ${formatCost(total)} = ${formatCost(sessionCost.total)} requests + ${formatCost(sessionOtherCost.total)} compaction/summary usage`
+      `Session cost: ${approxMark(sessionCostSources)}${formatCost(total)} = ${formatCost(sessionCost.total)} requests + ${formatCost(sessionOtherCost.total)} compaction/summary usage`
     );
     for (const [label, totals] of costByModel) {
       lines.push(
-        `  ${label}: ${totals.calls} model call${totals.calls !== 1 ? "s" : ""}, ${formatNumber(totals.tokens)} tok → ${formatCost(totals.cost.total)}${originSuffix(totals.origin, totals.sources)}`
+        `  ${label}: ${totals.calls} model call${totals.calls !== 1 ? "s" : ""}, ${formatNumber(totals.tokens)} tok → ${approxMark(totals.sources)}${formatCost(totals.cost.total)}${originSuffix(totals.origin, totals.sources)}`
       );
+    }
+    if (sessionCostSources.has("estimated")) {
+      lines.push(
+        "  ≈ estimated locally from the price files below, not billed by the provider; the quoted name is the price entry that supplied the rates, not the model that ran"
+      );
+    }
+    if (sessionCostSources.has("reported")) {
+      lines.push("  no ≈ mark = cost as billed by the provider");
     }
     if (modelsWithoutPricing.size > 0) {
       lines.push(
-        `  no prices configured for: ${[...modelsWithoutPricing].join(", ")} (add them to pi-stats.pricing.json)`
+        `  no prices configured for: ${[...modelsWithoutPricing].join(", ")} (add them to pi-request-stats.pricing.json)`
       );
     }
     return lines;
@@ -1101,16 +1201,25 @@ export default function (pi: ExtensionAPI) {
       `mode=${pricingConfig.mode}  currency=${pricingConfig.currency}  per ${formatNumber(pricingConfig.perTokens)} tokens  multiplier=${pricingConfig.multiplier}  preferReportedCost=${pricingConfig.preferReportedCost}`,
       `cost estimation: ${pricingConfig.costEnabled ? "on" : "OFF"} (set by ${pricingConfig.costEnabledSource})`,
       `models priced: ${pricingConfig.models.size > 0 ? [...new Set([...pricingConfig.models.values()].map((pricing) => pricing.key))].join(", ") : "none"}`,
-      `fallback for unpriced models: ${pricingConfig.fallbackLabel || "none"}`,
+      `models with no entry of their own are estimated with: ${pricingConfig.fallbackLabel ? `the "${pricingConfig.fallbackLabel}" entry's rates` : "nothing (they price to $0)"}`,
+      "figures marked ≈ are estimated from the files above; unmarked figures are what the provider billed",
     ];
     for (const error of pricingConfig.errors) lines.push(`⚠️ ${error}`);
     return lines;
   }
 
+  /** Display id of the model of the last request, or the one currently selected. */
+  function currentModelLabel(ctx: ExtensionContext): string {
+    const last = [...costByModel.keys()].pop();
+    if (last) return last;
+    const model = ctx.model as { id?: string; provider?: string } | undefined;
+    return modelLabel(model?.provider, model?.id ?? undefined);
+  }
+
   /** Model of the last request, or the one currently selected. */
   function relevantPricing(ctx: ExtensionContext): ModelMatch | undefined {
-    const last = [...costByModel.keys()].pop();
-    if (last) {
+    const last = currentModelLabel(ctx);
+    if (last !== "unknown model") {
       const slash = last.indexOf("/");
       const provider = slash > 0 ? last.slice(0, slash) : undefined;
       const model = slash > 0 ? last.slice(slash + 1) : last;
@@ -1129,7 +1238,7 @@ export default function (pi: ExtensionAPI) {
       "/cost rates [model]   resolved prices for every model, or just one",
       "/cost reload [path]   re-read pricing.json (optionally from another path) and recompute",
       "/cost off | on        stop / resume cost estimation (flip with /cost toggle, status with /cost status)",
-      "                      off also works in the files (\"cost\": false) and the environment (PI_STATS_COST=off)",
+      "                      off also works in the files (\"cost\": false) and the environment (PI_REQUEST_STATS_COST=off)",
     ];
   }
 
@@ -1200,7 +1309,7 @@ export default function (pi: ExtensionAPI) {
     const textStr =
       shown.textTokens > 0 ? `  💬 ${formatRate(shown.textTokens, shown.textMs)}` : "  💬 —";
     const toolStr = toolMs > 0 ? `  🔧 ${formatDuration(toolMs)}` : "";
-    const costStr = costTotal > 0 ? `  💵 ${formatCostShort(costTotal)}` : "";
+    const costStr = costTotal > 0 ? `  💵 ${approxMark(sessionCostSources)}${formatCostShort(costTotal)}` : "";
 
     return ` ⏱ ${timeStr}${thinkingStr}${textStr} tk/s${toolStr}${costStr}${compactionStr}`;
   }

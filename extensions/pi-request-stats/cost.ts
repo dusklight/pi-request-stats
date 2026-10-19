@@ -1,5 +1,5 @@
 /**
- * Cost estimation for pi-stats.
+ * Cost estimation for pi-request-stats.
  *
  * Prices come from a JSON configuration file. They use the same unit and shape as
  * pi's own model catalog (`cost.input` / `output` / `cacheRead` / `cacheWrite` per
@@ -9,12 +9,12 @@
  *
  * Resolution order (later files win, model by model):
  *   1. pricing.json next to this file (bundled defaults)
- *   2. ~/.pi/agent/pi-stats.pricing.json (user override)
- *   3. <cwd>/.pi/pi-stats.pricing.json   (project override)
- *   4. $PI_STATS_PRICING, or the path given to /cost reload <path>
+ *   2. ~/.pi/agent/pi-request-stats.pricing.json (user override)
+ *   3. <cwd>/.pi/pi-request-stats.pricing.json   (project override)
+ *   4. $PI_REQUEST_STATS_PRICING, or the path given to /cost reload <path>
  *
  * Estimation itself can be switched off — `"cost": false` in any of those files,
- * `PI_STATS_COST=off` / `PI_STATS_NO_COST=1` in the environment, or `/cost off` at
+ * `PI_REQUEST_STATS_COST=off` / `PI_REQUEST_STATS_NO_COST=1` in the environment, or `/cost off` at
  * runtime. With it off every usage record prices to zero, so the status bar drops the
  * money readout and no "add prices for this model" hint is shown.
  */
@@ -55,13 +55,30 @@ export interface CostBreakdown {
   total: number;
 }
 
+/**
+ * The money figure pi writes into `usage.cost` when the provider prices the model.
+ * Mirrors pi-ai's `Usage["cost"]`; every field is optional so a provider that reports
+ * only part of the split still prices.
+ */
+export interface ReportedCost {
+  input?: number;
+  output?: number;
+  /** Cache hits — note pi spells this `cacheRead`, while `CostBreakdown` says `cachedInput`. */
+  cacheRead?: number;
+  cacheWrite?: number;
+  cacheWrite1h?: number;
+  total?: number;
+}
+
 export interface EstimateUsage {
   input: number;
   output: number;
   cacheRead: number;
   cacheWrite: number;
   cacheWrite1h?: number;
-  cost?: Partial<CostBreakdown>;
+  /** pi's `Usage.totalTokens`; used for per-model token totals when the engine reports it. */
+  totalTokens?: number;
+  cost?: ReportedCost;
 }
 
 /** Where a cost figure came from. `off` means estimation was disabled by the user. */
@@ -290,6 +307,9 @@ function parseTiers(entry: Record<string, unknown>, modelKey: string, errors: st
   return tiers;
 }
 
+/** Top-level blocks holding long-context rates — these are tiers, never price modes. */
+const TIER_BLOCK_KEYS = new Set(["long", "long-context", "long-context-rates"]);
+
 function thresholdOf(fields: Map<string, number>): number | undefined {
   for (const alias of THRESHOLD_KEYS) {
     const found = fields.get(alias);
@@ -330,6 +350,7 @@ function parseModel(modelKey: string, entry: unknown, errors: string[], allowEmp
       if (key.startsWith("_")) continue;
       const name2 = normalize(key);
       if (META_KEYS.has(name2) || name2 === "tiers" || name2 === "per-tokens" || name2 === "unit") continue;
+      if (TIER_BLOCK_KEYS.has(name2)) continue; // long-context rates, handled after the modes
       if (name2 === "cost") {
         addMode(modes, "standard", value, modelKey, errors);
         const tiers = parseTiers({ tiers: (value as Record<string, unknown>)?.tiers } as Record<string, unknown>, modelKey, errors);
@@ -341,8 +362,21 @@ function parseModel(modelKey: string, entry: unknown, errors: string[], allowEmp
   }
 
   // Simplest form: rates listed directly on the entry, optionally with a `long` block.
+  let ratesFromEntryItself = false;
   if (Object.keys(modes).length === 0) {
     addMode(modes, "standard", raw, modelKey, errors);
+    ratesFromEntryItself = true;
+  }
+
+  // Long-context blocks sitting beside the rates rather than inside a mode
+  // ({ standard: {...}, long: {...} }, or a top-level `tiers` array) belong to the standard
+  // price list. Left alone they would be read as a bogus mode named "long".
+  if (!ratesFromEntryItself) {
+    const looseTiers = parseTiers(raw, modelKey, errors);
+    if (looseTiers.length > 0) {
+      const target = modes.standard ?? modes[Object.keys(modes)[0]];
+      if (target) target.tiers.push(...looseTiers);
+    }
   }
 
   const modeNames = Object.keys(modes);
@@ -397,7 +431,7 @@ function readJson(path: string, errors: string[]): RawFile | null {
 }
 
 /**
- * Load and merge pricing files. `explicitPath` (from $PI_STATS_PRICING or a
+ * Load and merge pricing files. `explicitPath` (from $PI_REQUEST_STATS_PRICING or a
  * command) has the highest precedence.
  */
 export function loadPricing(cwd: string, explicitPath?: string): PricingConfig {
@@ -405,10 +439,10 @@ export function loadPricing(cwd: string, explicitPath?: string): PricingConfig {
   const files: RawFile[] = [];
   const candidates = [
     join(extensionDir(), "pricing.json"),
-    join(homedir(), ".pi", "agent", "pi-stats.pricing.json"),
-    join(cwd, ".pi", "pi-stats.pricing.json"),
+    join(homedir(), ".pi", "agent", "pi-request-stats.pricing.json"),
+    join(cwd, ".pi", "pi-request-stats.pricing.json"),
   ];
-  const extra = explicitPath || process.env.PI_STATS_PRICING;
+  const extra = explicitPath || process.env.PI_REQUEST_STATS_PRICING;
   if (extra) candidates.push(extra);
 
   for (const candidate of candidates) {
@@ -500,17 +534,17 @@ export function loadPricing(cwd: string, explicitPath?: string): PricingConfig {
     }
   }
 
-  const envMode = process.env.PI_STATS_PRICING_MODE;
+  const envMode = process.env.PI_REQUEST_STATS_PRICING_MODE;
   if (envMode) config.mode = normalize(envMode);
   // The environment beats the files, so one shell setting overrides a whole project tree.
-  const envCost = readEnvFlag("PI_STATS_COST", errors);
+  const envCost = readEnvFlag("PI_REQUEST_STATS_COST", errors);
   if (envCost !== undefined) {
     config.costEnabled = envCost;
-    config.costEnabledSource = "PI_STATS_COST";
+    config.costEnabledSource = "PI_REQUEST_STATS_COST";
   }
-  if (readEnvFlag("PI_STATS_NO_COST", errors) === true) {
+  if (readEnvFlag("PI_REQUEST_STATS_NO_COST", errors) === true) {
     config.costEnabled = false;
-    config.costEnabledSource = "PI_STATS_NO_COST";
+    config.costEnabledSource = "PI_REQUEST_STATS_NO_COST";
   }
   // The fallback entry may live in a file read after the one that named it.
   if (config.fallbackModel) {

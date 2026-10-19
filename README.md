@@ -1,9 +1,4 @@
-> [!NOTE]
-> `INITIAL_REQUIREMENTS.md` was used for the initial prompt and implementation, then the tokens-per-second feature, `README.md`, and `.gitignore` were added afterwards, all locally using `llama.cpp` with `Qwen 3.8 Flash Next Q4` and `pi`.
->
-> Subsequent features and updates were implemented using `Strata` with `Qwen 3.8 Flash Next ISTA-DASLab IQ3_S`.
-
-# pi-stats
+# pi-request-stats
 
 A [pi](https://pi.dev) extension that reports request timing, token throughput, compaction counts,
 and estimated request cost for your coding sessions.
@@ -11,9 +6,11 @@ and estimated request cost for your coding sessions.
 ## What it shows
 
 - **Status bar** — live elapsed time with thinking and answering rates while a request runs,
-  plus the tool time excluded so far, the estimated cost so far, and the compaction count:
+  plus the tool time excluded so far, the estimated cost so far, and the compaction count
+  (the `≈` in front of the money means the figure was estimated from the price file rather
+  than billed by the provider — see [Estimated cost](#estimated-cost)):
   ```
-   ⏱ 12.3s  🧠 42.1  💬 68.3 tk/s  🔧 4.2s  💵 $1.42  📦 2
+   ⏱ 12.3s  🧠 42.1  💬 68.3 tk/s  🔧 4.2s  💵 ≈$1.42  📦 2
   ```
 - **Request-complete notification** — one line per phase, each with its own rate:
   ```
@@ -22,8 +19,13 @@ and estimated request cost for your coding sessions.
   💬 answer 556 tok @ 68.3 tok/s (8.1s)
   ⚙️ tool-call args 129 tok @ 55.0 tok/s (2.3s)
   ⚡ generation total 1,026 tok @ 91.0 tok/s
-  💵 cost $0.1940 — $0.0860 in / $0.0140 cached / $0.0750 cache write / $0.0190 out (gpt-6.1-sol @ standard)
+  💵 cost ≈$0.1940 — $0.0860 in / $0.0140 cached / $0.0750 cache write / $0.0190 out (estimated, priced as "gpt-6.1-sol" standard rates)
   ```
+
+  That cost line uses the **brief** price-source wording, since this summary is read right after
+  the request it describes; `/stats` and `/cost` print the **full** version, which names the model
+  and spells out that the quoted name is a price entry — see
+  [How every figure is labelled](#how-every-figure-is-labelled).
 - **`/stats` command** — on-demand breakdown:
   - Requests and compactions in the session
   - Last request: wall time split into generating + tools, then the per-phase rates
@@ -81,10 +83,10 @@ Price lists are read in this order, and later files win model by model:
 
 | File | Purpose |
 | --- | --- |
-| `extensions/pi-stats/pricing.json` | bundled prices (GPT-6.1 Sol, Astra and Luna from the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing)) |
-| `~/.pi/agent/pi-stats.pricing.json` | your own models and overrides |
-| `<cwd>/.pi/pi-stats.pricing.json` | per-project overrides |
-| `$PI_STATS_PRICING`, `--pi-stats-pricing <path>`, `/cost reload <path>` | explicit file |
+| `extensions/pi-request-stats/pricing.json` | bundled prices (GPT-6.1 Sol, Astra and Luna from the [OpenAI pricing page](https://developers.openai.com/api/docs/pricing)) |
+| `~/.pi/agent/pi-request-stats.pricing.json` | your own models and overrides |
+| `<cwd>/.pi/pi-request-stats.pricing.json` | per-project overrides |
+| `$PI_REQUEST_STATS_PRICING`, `--pi-request-stats-pricing <path>`, `/cost reload <path>` | explicit file |
 
 All rates are per **1,000,000 tokens** in one currency, and use the same field names as pi's
 own model catalog, so an entry can be pasted straight from a pi `models.json` file. The
@@ -94,7 +96,7 @@ Fast (2x) and Ultrafast (6x, where the page lists it) — each with its long-con
 The bundled numbers were read from the page on 2026-10-18. A user override looks like this:
 
 ```jsonc
-// ~/.pi/agent/pi-stats.pricing.json
+// ~/.pi/agent/pi-request-stats.pricing.json
 {
   "mode": "standard",          // which price list to estimate with
   "fallbackModel": "gpt-6.1-sol", // prices for models that have no entry of their own
@@ -120,8 +122,28 @@ The bundled numbers were read from the page on 2026-10-18. A user override looks
 Field names are matched loosely (`cachedInput`, `cacheRead`, `cached_input`, `Cache Writes`,
 `writeOutputTokens`, `reasoningOutputTokens`, … all work), model ids are matched loosely too
 (`gpt-6.1-sol:Q4_K_M` and `gpt-6.1-sol-2026-04-01` both find `gpt-6.1-sol`), and a model with
-no entry at all is priced with `fallbackModel` — shown as `fallback prices` so it is obvious
-that the figure is borrowed. Unpriced models leave a one-off hint naming the id to add.
+no entry at all is priced with `fallbackModel`.
+
+### How every figure is labelled
+
+Every money readout says where its number came from, so an estimate never looks like an invoice.
+The report readouts (`/stats`, `/cost`) spell it out in full; only the request-complete summary
+uses the short form at the end of the table.
+
+| Readout | Meaning |
+| --- | --- |
+| `≈$0.19` | estimated from the price file (status bar, session cost, per-model and per-request lines) |
+| `$0.19` with no `≈` | cost as billed by the provider, taken from pi's reported usage |
+| `≈$0.19 … (estimate from the price file: "gpt-6.1-sol" entry, standard rates)` | estimated with rates from a price entry of that name — the quoted name is the **price entry**, not a claim about which model ran |
+| `… (estimate from the price file: "llama-server/qwen3.8" has no entry of its own, so the "gpt-6.1-sol" entry's standard rates were used — that quoted name is the pricing entry, not the model)` | the borrowed-rates case: your model is not in the price file at all, and was priced like another one |
+| `(billed by the provider — not an estimate)` | the provider reported the cost, so no local rate was used |
+| `(sum of provider-billed and estimated parts — /cost breaks them down per model)` | one request touched several models priced different ways |
+| `≈$0.19 … (estimated, priced as "gpt-6.1-sol" standard rates)` | **short form** (request-complete summary only): `priced as` marks the quoted name as a price entry by itself. It is identical in the borrowed-rates case — the readout it sits under already names the model, so it needs no extra clause |
+| `(billed by the provider)` | short form of the billed case |
+
+`/cost`, `/cost modes` and `/cost rates` repeat the same distinction, and `/cost rates` names the
+entry used for unlisted models. Unpriced models (no entry, and no `fallbackModel`) leave a one-off
+hint naming the id to add.
 
 ### Switching cost estimation off
 
@@ -132,11 +154,11 @@ Any of these turns estimation off; `/cost on` turns it back on:
 | --- | --- | --- |
 | `/cost off` · `/cost on` · `/cost toggle` | current session | flips the setting and re-prices (or zeroes) the session totals immediately |
 | `"cost": false` in any price file | that file's scope | also accepted as `"costEnabled"`, `"costEstimates"`, `"estimateCost"`, or `"cost": "off"`; a project file can switch money off for one directory |
-| `PI_STATS_COST=off` | environment | `on` switches it back on; `PI_STATS_NO_COST=1` is a shorthand for off |
-| `pi -e . --pi-stats-no-cost` | one run | same as the environment setting, for a single session |
+| `PI_REQUEST_STATS_COST=off` | environment | `on` switches it back on; `PI_REQUEST_STATS_NO_COST=1` is a shorthand for off |
+| `pi -e . --pi-request-stats-no-cost` | one run | same as the environment setting, for a single session |
 
 Precedence runs files → environment → `/cost` command, so a project file never outvotes an
-explicit `PI_STATS_COST` or a `/cost on` in the session you are in.
+explicit `PI_REQUEST_STATS_COST` or a `/cost on` in the session you are in.
 
 With estimation off, every usage record prices to $0, the `💵` figure disappears from the status
 bar, the per-request cost line is left out of the completion notification, and `/stats` and
@@ -161,17 +183,36 @@ session history, so the numbers always reflect the current price list. Reloading
 the `"cost"` flag from the files, which is why a `/cost off` followed by a `/cost reload`
 can turn estimation back on.
 
-## Install (local use)
+Every line of `/cost` output marks whether a figure is billed or estimated (see
+[How every figure is labelled](#how-every-figure-is-labelled) above), and names the price entry
+whose rates were used. `/cost status` reports the on/off setting without changing it.
 
-From this directory:
+## Install
+
+From npm (personal install; adds an entry to `~/.pi/agent/settings.json`):
+
+```bash
+pi install npm:pi-request-stats
+pi install npm:pi-request-stats@1.0.0   # pinned
+```
+
+Or try it for one run without touching settings:
+
+```bash
+pi -e npm:pi-request-stats
+```
+
+From a git checkout instead of npm:
+
+```bash
+pi install git:github.com/dusklight/pi-request-stats@v1.0.0
+```
+
+From a local checkout (development — add `-l`/`--local` to install into `.pi/settings.json`, which
+pi loads only after you grant project trust):
 
 ```bash
 pi install .
-```
-
-Or load it for a single run without touching settings:
-
-```bash
 pi -e .
 ```
 
@@ -179,13 +220,32 @@ Then start `pi` normally. Use `/stats` anytime to print the full report, and `/c
 the estimated spend and the prices behind it (or `/cost off` to drop the money readout — see
 above).
 
-Then start `pi` normally. Use `/stats` anytime to print the full report, and `/cost` to see
-the estimated spend and the prices behind it.
+**Requirements:** pi ≥ 1.3 (declared as a peer dependency — pi provides it, the package never
+bundles it) and Node ≥ 22.19, pi's own minimum.
+
+## Development
+
+```bash
+npm install      # dev-only: typescript, @types/node and pi's types (peer, never published)
+npm run check    # strict tsc --noEmit, then the test suite
+npm run typecheck
+npm test         # node --test: pricing logic + extension registration and history attribution
+npm run pack:list # show exactly what would go into the published tarball
+```
+
+Pi loads the `.ts` sources directly through `jiti`, so there is no build step; the published
+tarball is just `extensions/`, `README.md`, `LICENSE` and `CHANGELOG.md`.
 
 ## Notes
 
-- Written in TypeScript; Pi loads it directly via `jiti` — no build step.
+- Written in TypeScript; Pi loads it directly via `jiti` — no build step. `CHANGELOG.md` records
+  what each release changed.
 - Costs are estimates unless the provider reports them. Rates for hosted models are only as
   current as the price list in `pricing.json`; update it when the provider changes prices.
   Local servers are priced by borrowing another model's rates (`fallbackModel` or an alias),
-  which is a comparison figure rather than money spent.
+  which is a comparison figure rather than money spent — and every such figure says so.
+
+## How it was developed
+
+- `INITIAL_REQUIREMENTS.md` was used for the initial prompt and implementation, then the tokens-per-second feature, `README.md`, and `.gitignore` were added afterwards, all locally using `llama.cpp` with `Qwen 3.8 Flash Next Q4` and `pi`.
+- Subsequent features and updates were implemented using `Strata` with `Qwen 3.8 Flash Next ISTA-DASLab IQ3_S`.
